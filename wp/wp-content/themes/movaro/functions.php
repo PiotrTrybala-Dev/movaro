@@ -1,35 +1,39 @@
 <?php
-
-/* global options */
-
-add_filter('show_admin_bar', '__return_false');
-add_filter('wpcf7_autop_or_not', '__return_false');
-
-/* blocks */
-
-add_action('init', 'register_acf_blocks');
-
-function register_acf_blocks()
-{
-    register_block_type(__DIR__ . "/blocks/hero");
-    register_block_type(__DIR__ . "/blocks/about");
-    register_block_type(__DIR__ . "/blocks/benefits");
-    register_block_type(__DIR__ . "/blocks/work_benefits");
-    register_block_type(__DIR__ . "/blocks/story");
-    register_block_type(__DIR__ . "/blocks/introduction");
-    register_block_type(__DIR__ . "/blocks/cta");
-    register_block_type(__DIR__ . "/blocks/reviews");
-    register_block_type(__DIR__ . "/blocks/shop");
-    register_block_type(__DIR__ . "/blocks/faq");
-    register_block_type(__DIR__ . "/blocks/contact");
+if (! defined('ABSPATH')) {
+    exit;
 }
+
+require_once get_theme_file_path("inc/blocks.php");
+require_once get_theme_file_path("inc/custom-enqueue.php");
+require_once get_theme_file_path("inc/shared.php");
+require_once get_theme_file_path("inc/options-pages.php");
+require_once get_theme_file_path("inc/menus.php");
+require_once get_theme_file_path("inc/forms.php");
+require_once get_theme_file_path("inc/theme-support.php");
+
+// add_action('init', 'register_acf_blocks');
+
+// function register_acf_blocks()
+// {
+//     register_block_type(__DIR__ . "/src/blocks/hero");
+//     register_block_type(__DIR__ . "/src/blocks/about");
+//     register_block_type(__DIR__ . "/src/blocks/benefits");
+//     register_block_type(__DIR__ . "/src/blocks/work_benefits");
+//     register_block_type(__DIR__ . "/src/blocks/story");
+//     register_block_type(__DIR__ . "/src/blocks/introduction");
+//     register_block_type(__DIR__ . "/src/blocks/cta");
+//     register_block_type(__DIR__ . "/src/blocks/reviews");
+//     register_block_type(__DIR__ . "/src/blocks/shop");
+//     register_block_type(__DIR__ . "/src/blocks/faq");
+//     register_block_type(__DIR__ . "/src/blocks/contact");
+// }
 
 /* ajax */
 
-include_once(__DIR__ . "/ajax/shop.php");
+// include_once(__DIR__ . "/src/ajax/shop.php");
 
-add_action('wp_ajax_load_more_shop', 'load_more_shop_callback');
-add_action('wp_ajax_nopriv_load_shop', 'load_more_shop_callback');
+// add_action('wp_ajax_load_more_shop', 'load_more_shop_callback');
+// add_action('wp_ajax_nopriv_load_shop', 'load_more_shop_callback');
 
 /* scripts & styles */
 
@@ -41,9 +45,6 @@ function dynamicAssetVersion(string $filePath): string
         ? (string)filemtime($filePath)
         : '1.0';
 }
-
-
-
 function enqueue_scripts(): void
 {
     $themeUrl = get_template_directory_uri();
@@ -76,52 +77,56 @@ function enqueue_scripts(): void
 
 /* menus */
 
-add_action('init', 'register_menus');
+// add_action('init', 'register_menus');
 
-function register_menus()
-{
-    register_nav_menus(
-        array(
-            "header-menu" => __("Menu nagłówka", 'movaro'),
-        )
-    );
-}
+// function register_menus()
+// {
+//     register_nav_menus(
+//         array(
+//             "header-menu" => __("Menu nagłówka", 'movaro'),
+//         )
+//     );
+// }
 
-/* option pages */
+// /* option pages */
 
-add_action('acf/init', function () {
-    if (function_exists('acf_add_options_page')) {
+// add_action('acf/init', function () {
+//     if (function_exists('acf_add_options_page')) {
 
-        acf_add_options_page(array(
-            'page_title' => 'Ustawienia ogólne',
-            'menu_title' => 'Ustawienia ogólne',
-            'menu_slug' => 'theme-general-settings',
-            'capability' => 'edit_posts',
-            'redirect' => true
-        ));
-    }
-});
+//         acf_add_options_page(array(
+//             'page_title' => 'Ustawienia ogólne',
+//             'menu_title' => 'Ustawienia ogólne',
+//             'menu_slug' => 'theme-general-settings',
+//             'capability' => 'edit_posts',
+//             'redirect' => true
+//         ));
+//     }
+// });
 
-add_filter(
-    'wpcf7_form_elements',
-    function ($content) {
-        return preg_replace(
-            '/<label(\s+[^>]*)?>/i',
-            '<label$1 class="b-contact__form-checkbox">',
-            $content
-        );
-    }
-);
+// add_filter(
+//     'wpcf7_form_elements',
+//     function ($content) {
+//         return preg_replace(
+//             '/<label(\s+[^>]*)
+//             '<label$1 class="b-contact__form-checkbox">',
+//             $content
+//         );
+//     }
+// );
 
-add_filter(
-    'wpcf7_form_response_output',
-    function ($output, $class, $content, $form) {
-        return preg_replace(
-            '/class="([^"]*wpcf7-response-output[^"]*)"/i',
-            'class="b-contact__form-response $1"',
-            $output
-        );
-    },
-    10,
-    4
-);
+// add_filter(
+//     'wpcf7_form_response_output',
+//     function ($output, $class, $content, $form) {
+//         return preg_replace(
+//             '/class="([^"]*wpcf7-response-output[^"]*)"/i',
+//             'class="b-contact__form-response $1"',
+//             $output
+//         );
+//     },
+//     10,
+//     4
+// );
+
+// add_action('after_setup_theme', function () {
+//     add_theme_support('woocommerce');
+// });

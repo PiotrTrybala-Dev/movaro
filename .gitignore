@@ -54,6 +54,6 @@
 /wp/wp-content/themes/movaro/dist
 
 /deployment/inventory/group_vars/staging/vault.yaml
-/deployment/tmp/dump.sql
+/deployment/playbooks/tmp/dump.sql
 
 .vault_pass

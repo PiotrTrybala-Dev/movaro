@@ -6,7 +6,7 @@ app_port: 80
 env: staging
 domain_name: movaro.staging.toolkit23.com
 
-docker_image: ghcr.io/piotrtrybala/movaro:v0.0.1
+docker_image: ghcr.io/piotrtrybala/movaro:v0.0.3
 
 db_name: staging
 db_container_name: movaro-db-staging

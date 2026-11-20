@@ -1,0 +1,396 @@
+<?php
+/**
+ * Cache-safe PageVisit tracking.
+ *
+ * @package Pinterest_For_WooCommerce/Classes/
+ * @version 1.0.0
+ */
+
+namespace Automattic\WooCommerce\Pinterest\Tracking;
+
+use Automattic\WooCommerce\Pinterest\Logger;
+use Automattic\WooCommerce\Pinterest\Tracking;
+use Automattic\WooCommerce\Pinterest\Tracking\Data\None;
+use Automattic\WooCommerce\Pinterest\Tracking\Data\Product;
+use Automattic\WooCommerce\Pinterest\Tracking\Data\User;
+use Automattic\WooCommerce\Pinterest\Utilities\CrawlerDetector;
+use Throwable;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+/**
+ * Generates browser PageVisit events and handles their CAPI beacons.
+ *
+ * @class   PageVisit
+ * @version 1.6.3
+ */
+class PageVisit {
+
+	/**
+	 * Public AJAX action used by the PageVisit beacon.
+	 *
+	 * @var string
+	 */
+	const AJAX_ACTION = 'pinterest_for_woocommerce_page_visit';
+
+	/**
+	 * Registers the public PageVisit beacon handlers.
+	 *
+	 * The endpoint intentionally has no nonce. A nonce rendered into cacheable
+	 * HTML expires while the cached page remains live, and a logged-out nonce is
+	 * shared by every visitor anyway. The endpoint performs no privileged action,
+	 * accepts only a constrained PageVisit payload, and checks tracking settings
+	 * and consent before forwarding the event.
+	 *
+	 * @return void
+	 */
+	public static function init_hooks() {
+		add_action( 'wp_ajax_' . static::AJAX_ACTION, array( static::class, 'handle_request' ) );
+		add_action( 'wp_ajax_nopriv_' . static::AJAX_ACTION, array( static::class, 'handle_request' ) );
+	}
+
+	/**
+	 * Resolve the product shown on arrival, including a complete variation selection.
+	 *
+	 * @return \WC_Product|false|null Product to report for the visit.
+	 */
+	public static function get_page_product() {
+		$product = is_product() ? wc_get_product() : false;
+		// A form submission can render a different selection from the landing URL or defaults.
+		$submitted = ! empty( $_POST ); // phpcs:ignore WordPress.Security.NonceVerification.Missing -- Only checks whether form data was sent.
+		if ( ! $product instanceof \WC_Product_Variable || $submitted || post_password_required( $product->get_id() ) ) {
+			return $product;
+		}
+
+		$defaults   = (array) $product->get_default_attributes();
+		$attributes = array();
+		foreach ( $product->get_variation_attributes() as $name => $options ) {
+			$key   = wc_variation_attribute_name( $name );
+			$value = $defaults[ sanitize_title( $name ) ] ?? '';
+			// Use the landing URL's selection in preference to the product default.
+			if ( isset( $_GET[ $key ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification.Recommended -- Read-only storefront selection.
+				$value = is_string( $_GET[ $key ] ) ? wp_unslash( $_GET[ $key ] ) : ''; // phpcs:ignore WordPress.Security.NonceVerification.Recommended, WordPress.Security.ValidatedSanitizedInput.InputNotSanitized -- Checked below against the sanitized value and variation options.
+				// Classic and block selectors can normalize noncanonical URL values differently.
+				if ( sanitize_text_field( $value ) !== $value ) {
+					return $product;
+				}
+			}
+			if ( ! is_string( $value ) || '' === $value || ! is_array( $options ) ) {
+				return $product;
+			}
+
+			if ( taxonomy_exists( $name ) ) {
+				$value = sanitize_title( $value );
+			} elseif ( sanitize_title( $value ) === $value ) {
+				// Classic dropdowns can render a custom attribute selected by its slug.
+				$matches = array_keys( array_map( 'sanitize_title', $options ), $value, true );
+				$value   = 1 === count( $matches ) ? $options[ $matches[0] ] : '';
+			}
+			if ( '' === $value || ! in_array( $value, $options, true ) ) {
+				return $product;
+			}
+			$attributes[ $key ] = $value;
+		}
+
+		if ( ! $attributes ) {
+			return $product;
+		}
+
+		$store = \WC_Data_Store::load( 'product' );
+		if ( ! $store->has_callable( 'find_matching_product_variation' ) ) {
+			return $product;
+		}
+		// @phpstan-ignore-next-line method.notFound (WC_Data_Store forwards this to the product data store.)
+		$variation_id = $store->find_matching_product_variation( $product, $attributes );
+		$variation    = is_numeric( $variation_id ) && $variation_id > 0 ? wc_get_product( $variation_id ) : false;
+		if ( ! $variation instanceof \WC_Product_Variation || $product->get_id() !== $variation->get_parent_id() || true !== $variation->variation_is_visible() ) {
+			return $product;
+		}
+		if ( 'yes' === get_option( 'woocommerce_hide_out_of_stock_items' ) && true !== $variation->is_in_stock() ) {
+			return $product;
+		}
+
+		return $variation;
+	}
+
+	/**
+	 * Builds a cache-safe Pinterest Tag call and optional CAPI beacon.
+	 *
+	 * @param array $data Prepared Pinterest Tag PageVisit data.
+	 *
+	 * @return string JavaScript event code.
+	 */
+	public static function get_tag_event_code( array $data ) {
+		unset( $data['event_id'] );
+
+		$event_data = wp_json_encode( (object) $data, JSON_HEX_TAG | JSON_UNESCAPED_SLASHES );
+		$event_data = $event_data ? $event_data : '{}';
+
+		return sprintf(
+			'(function(){%1$svar eventData=%2$s;eventData.event_id=eventId;pintrk("track","%3$s",eventData);%4$s}());',
+			self::get_event_id_code(),
+			$event_data,
+			Tracking::EVENT_PAGE_VISIT,
+			self::get_beacon_code( $data['product_id'] ?? null )
+		);
+	}
+
+	/**
+	 * Prints the CAPI beacon on its own for stores without an active Tag.
+	 *
+	 * Prints nothing when the Conversions API is disabled.
+	 *
+	 * @since 1.5.1
+	 *
+	 * @return void
+	 */
+	public static function print_beacon_script() {
+		self::print_beacon_for_product( null );
+	}
+
+	/**
+	 * Prints the standalone CAPI beacon with the resolved product ID.
+	 *
+	 * @param int|null $product_id Product ID resolved for the visit.
+	 * @return void
+	 */
+	public static function print_beacon_for_product( $product_id ) {
+		$beacon_code = self::get_beacon_code( $product_id );
+		if ( ! $beacon_code ) {
+			return;
+		}
+
+		wp_print_inline_script_tag( '(function(){' . self::get_event_id_code() . $beacon_code . '}());' );
+	}
+
+	/**
+	 * Builds the JavaScript that generates a browser-side PageVisit event ID.
+	 *
+	 * @since 1.5.1
+	 *
+	 * @return string JavaScript defining `eventId`.
+	 */
+	private static function get_event_id_code() {
+		return 'var eventId="page_"+(window.crypto&&window.crypto.randomUUID?window.crypto.randomUUID():Date.now().toString(36)+"_"+Math.random().toString(36).slice(2));';
+	}
+
+	/**
+	 * Builds the JavaScript that sends the PageVisit CAPI beacon.
+	 *
+	 * @since 1.5.1
+	 *
+	 * @param mixed $event_product_id Product ID from the storefront event data, if provided.
+	 * @return string JavaScript using `eventId`, or an empty string when the Conversions API is disabled.
+	 */
+	private static function get_beacon_code( $event_product_id ) {
+		if ( ! Pinterest_For_Woocommerce()::get_setting( 'track_conversions_capi' ) ) {
+			return '';
+		}
+
+		$product_code = '';
+		$product_id   = is_product() ? get_queried_object_id() : 0;
+		if ( $product_id && is_int( $event_product_id ) && $event_product_id > 0 && $event_product_id !== $product_id ) {
+			$variation = wc_get_product( $event_product_id );
+			if ( $variation instanceof \WC_Product_Variation && $product_id === $variation->get_parent_id() ) {
+				$product_id = $event_product_id;
+			}
+		}
+		$request_uri = isset( $_SERVER['REQUEST_URI'] ) && is_string( $_SERVER['REQUEST_URI'] )
+			? wp_unslash( $_SERVER['REQUEST_URI'] ) // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- Used only to compute the signature.
+			: '';
+		if ( $product_id && $request_uri ) {
+			$product_code = sprintf(
+				'requestData.append("product_id",%1$s);requestData.append("product_token",%2$s);',
+				wp_json_encode( (string) $product_id ),
+				wp_json_encode( self::get_product_token( $product_id, $request_uri ) )
+			);
+		}
+
+		// A prerender may never be viewed; send its beacon only after activation.
+		return sprintf(
+			'function sendPageVisit(){var requestData=new FormData();requestData.append("action",%1$s);requestData.append("event_id",eventId);requestData.append("event_source_url",window.location.href);%3$svar beaconSent=navigator.sendBeacon&&navigator.sendBeacon(%2$s,requestData);if(!beaconSent&&window.fetch){window.fetch(%2$s,{method:"POST",body:requestData,credentials:"same-origin",keepalive:true});}}if(document.prerendering){document.addEventListener("prerenderingchange",sendPageVisit,{once:true});}else{sendPageVisit();}',
+			wp_json_encode( static::AJAX_ACTION, JSON_HEX_TAG ),
+			wp_json_encode( admin_url( 'admin-ajax.php' ), JSON_HEX_TAG | JSON_UNESCAPED_SLASHES ),
+			$product_code
+		);
+	}
+
+	/**
+	 * Handles a browser-generated PageVisit CAPI beacon.
+	 *
+	 * @return void
+	 */
+	public static function handle_request() {
+		if ( ! Pinterest_For_Woocommerce()::get_setting( 'track_conversions' ) || ! Pinterest_For_Woocommerce()::get_setting( 'track_conversions_capi' ) ) {
+			self::reject( 'conversion tracking or the Conversions API is disabled' );
+			return;
+		}
+
+		/**
+		 * Filters whether to disable tracking based on user consent.
+		 *
+		 * @since 1.4.21
+		 *
+		 * @param bool $disable_tracking Whether to disable tracking due to user consent.
+		 */
+		$is_tracking_disabled_user_consent = apply_filters( 'woocommerce_pinterest_disable_tracking_user_consent', false );
+
+		/**
+		 * Filters whether to disable tracking.
+		 *
+		 * @since 1.4.0
+		 *
+		 * @param bool $disable_tracking Whether to disable tracking based on consent conditions.
+		 */
+		if ( apply_filters( 'woocommerce_pinterest_disable_tracking', $is_tracking_disabled_user_consent ) ) {
+			self::reject( 'tracking is disabled by consent or filter' );
+			return;
+		}
+
+		/**
+		 * Filters whether to skip Conversions API events based on user consent.
+		 *
+		 * @since 1.6.3
+		 *
+		 * @param bool $disable_conversions_api Whether to skip Conversions API events due to user consent.
+		 */
+		if ( apply_filters( 'woocommerce_pinterest_disable_conversions_api_user_consent', false ) ) {
+			self::reject( 'marketing consent for the Conversions API is not given' );
+			return;
+		}
+
+		if ( CrawlerDetector::is_crawler_request() ) {
+			self::reject( 'the request comes from a crawler' );
+			return;
+		}
+
+		// This is a public analytics beacon and intentionally is not nonce-gated.
+		$event_id_raw   = $_POST['event_id'] ?? ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput
+		$source_url_raw = $_POST['event_source_url'] ?? ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput
+
+		if ( ! is_string( $event_id_raw ) || ! is_string( $source_url_raw ) ) {
+			self::reject( 'event_id or event_source_url is not a string' );
+			return;
+		}
+
+		$event_id = sanitize_text_field( wp_unslash( $event_id_raw ) );
+		if ( ! preg_match( '/^page_[A-Za-z0-9_-]{10,100}$/', $event_id ) ) {
+			self::reject( 'event_id is malformed' );
+			return;
+		}
+
+		$source_url = esc_url_raw( wp_unslash( $source_url_raw ) );
+		$source_url = self::validate_source_url( $source_url );
+		if ( ! $source_url ) {
+			self::reject( 'event_source_url is not an absolute URL on this site' );
+			return;
+		}
+
+		$product_id    = $_POST['product_id'] ?? ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput
+		$product_token = $_POST['product_token'] ?? ''; // phpcs:ignore WordPress.Security.NonceVerification.Missing, WordPress.Security.ValidatedSanitizedInput
+		$product_id    = is_string( $product_id ) && ctype_digit( $product_id ) ? absint( $product_id ) : 0;
+
+		if ( ! $product_id || ! is_string( $product_token ) || ! hash_equals( self::get_product_token( $product_id, $source_url ), $product_token ) ) {
+			$product_id = url_to_postid( $source_url );
+		}
+
+		$data    = self::get_product_event_data( $event_id, $product_id ? wc_get_product( $product_id ) : false );
+		$user    = new User( \WC_Geolocation::get_ip_address(), wc_get_user_agent() );
+		$tracker = new Conversions( $user, $source_url );
+
+		try {
+			$tracker->track_event( Tracking::EVENT_PAGE_VISIT, $data );
+		} catch ( Throwable $e ) {
+			// Conversions::track_event() already logged the API error.
+			self::reject( 'the Conversions API dispatch failed' );
+			return;
+		}
+	}
+
+	/**
+	 * Logs why a beacon was dropped.
+	 *
+	 * @since 1.5.1
+	 *
+	 * @param string $reason Human readable rejection reason.
+	 *
+	 * @return void
+	 */
+	private static function reject( string $reason ) {
+		Logger::log( 'PageVisit beacon rejected: ' . $reason . '.', 'debug', 'conversions' );
+	}
+
+	/**
+	 * Sign the product and its route. Include the query because products can share a path.
+	 *
+	 * The salt-bound token does not expire, so cached pages can keep sending it.
+	 *
+	 * @since 1.6.3
+	 * @param int    $product_id Rendered product ID.
+	 * @param string $url        Rendered request URI or validated beacon URL.
+	 * @return string
+	 */
+	private static function get_product_token( int $product_id, string $url ) {
+		$parts = wp_parse_url( $url );
+		// A cached page can be served with a new Pinterest click ID.
+		$query = preg_replace( '/(^|&)epik(?:=[^&]*)?(?=&|$)/', '', $parts['query'] ?? '' );
+		$route = ( $parts['path'] ?? '/' ) . '?' . ltrim( $query ?? '', '&' );
+		return hash_hmac( 'sha256', 'pfw_page_visit|' . $product_id . '|' . $route, wp_salt() );
+	}
+
+	/**
+	 * Validates that an event source URL is an absolute http(s) URL on this site.
+	 *
+	 * Protocol-relative URLs, URLs carrying user info and over-long URLs are rejected.
+	 *
+	 * @since 1.5.1 Requires an http(s) scheme, no user info and at most 2048 characters.
+	 *
+	 * @param string $source_url Untrusted event source URL.
+	 *
+	 * @return string Valid source URL, or an empty string.
+	 */
+	private static function validate_source_url( string $source_url ) {
+		$source_url  = esc_url_raw( $source_url, array( 'http', 'https' ) );
+		$parts       = (array) wp_parse_url( $source_url );
+		$source_host = $parts['host'] ?? '';
+		$home_host   = wp_parse_url( home_url(), PHP_URL_HOST );
+
+		if (
+			strlen( $source_url ) > 2048
+			|| ! in_array( strtolower( $parts['scheme'] ?? '' ), array( 'http', 'https' ), true )
+			|| isset( $parts['user'] )
+			|| ! $source_host || ! $home_host || strtolower( $source_host ) !== strtolower( $home_host )
+		) {
+			return '';
+		}
+
+		return $source_url;
+	}
+
+	/**
+	 * Builds the common product data for Tag and CAPI PageVisit events.
+	 *
+	 * @param string                 $event_id Browser-generated event ID, if available.
+	 * @param \WC_Product|false|null $product  Visited product, if available.
+	 *
+	 * @return Product|None PageVisit event data.
+	 */
+	public static function get_product_event_data( string $event_id, $product ) {
+		if ( ! $product instanceof \WC_Product ) {
+			return new None( $event_id );
+		}
+
+		return new Product(
+			$event_id,
+			$product->get_id(),
+			$product->get_name(),
+			wc_get_product_category_list( $product instanceof \WC_Product_Variation ? $product->get_parent_id() : $product->get_id() ),
+			'brand',
+			wc_get_price_to_display( $product ),
+			get_woocommerce_currency(),
+			1
+		);
+	}
+}

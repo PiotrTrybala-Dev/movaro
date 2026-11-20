@@ -4,7 +4,7 @@ const CopyPlugin = require("copy-webpack-plugin");
 
 module.exports = {
     entry: {
-        app: path.resolve(__dirname, "assets/js/index.js"),
+        app: path.resolve(__dirname, "src/scripts/index.js"),
         // "editor": path.resolve(__dirname, "src/scss/editor.scss"),
     },
 

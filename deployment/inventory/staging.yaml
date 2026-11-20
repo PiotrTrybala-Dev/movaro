@@ -9,4 +9,4 @@ all:
 
     wordpress_nodes:
       hosts:
-        staging_server: {}           
+      staging_server: {}           
